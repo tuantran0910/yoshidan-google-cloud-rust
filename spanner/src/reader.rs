@@ -489,10 +489,7 @@ where
 /// Marks the shared invalidation flag if the error indicates the session was
 /// deleted on the server. Returns the original result for method chaining.
 #[inline]
-fn check_session_health<T>(
-    flag: &AtomicBool,
-    result: Result<T, Status>,
-) -> Result<T, Status> {
+fn check_session_health<T>(flag: &AtomicBool, result: Result<T, Status>) -> Result<T, Status> {
     if let Err(ref e) = result {
         if e.code() == Code::NotFound && e.message().contains("Session not found:") {
             flag.store(false, Ordering::SeqCst);
