@@ -1,5 +1,6 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::Arc;
 
 use prost_types::Struct;
 
@@ -278,6 +279,12 @@ impl Transaction {
     /// Used by `execute_concurrent` to clone the spanner client without mutably borrowing the transaction.
     pub(crate) fn as_ref_session(&self) -> &SessionHandle {
         self.session.as_ref().unwrap().deref()
+    }
+
+    /// Returns a shared invalidation flag for concurrent reads to signal
+    /// that the underlying session has been deleted on the server.
+    pub(crate) fn invalidation_flag(&self) -> Arc<AtomicBool> {
+        self.as_ref_session().invalidation_flag()
     }
 
     /// returns the owner ship of session.

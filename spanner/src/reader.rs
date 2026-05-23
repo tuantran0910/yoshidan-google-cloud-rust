@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use prost::Message;
@@ -485,7 +486,7 @@ where
     }
 }
 
-pub struct OwnedRowIterator<T: Reader> {
+pub struct OwnedRowIterator<'a, T: Reader> {
     streaming: Streaming<PartialResultSet>,
     client: Client,
     reader: T,
@@ -497,12 +498,15 @@ pub struct OwnedRowIterator<T: Reader> {
     resumable: bool,
     end_of_stream: bool,
     stream_retry: StreamingRetry,
+    invalidation_flag: Arc<AtomicBool>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<T: Reader> OwnedRowIterator<T> {
+impl<'a, T: Reader> OwnedRowIterator<'a, T> {
     pub(crate) async fn new(
         mut client: Client,
         reader: T,
+        invalidation_flag: Arc<AtomicBool>,
         option: Option<CallOptions>,
         disable_route_to_leader: bool,
     ) -> Result<Self, Status> {
@@ -528,6 +532,8 @@ impl<T: Reader> OwnedRowIterator<T> {
             resumable: true,
             end_of_stream: false,
             stream_retry: StreamingRetry::new(),
+            invalidation_flag,
+            _marker: std::marker::PhantomData,
         })
     }
 
@@ -569,6 +575,10 @@ impl<T: Reader> OwnedRowIterator<T> {
             let received = match self.streaming.message().await {
                 Ok(s) => s,
                 Err(e) => {
+                    // Set invalidation flag if session was deleted on server
+                    if e.code() == Code::NotFound && e.message().contains("Session not found:") {
+                        self.invalidation_flag.store(false, Ordering::SeqCst);
+                    }
                     if !self.reader.can_resume() || !self.resumable {
                         return Err(e);
                     }

@@ -314,13 +314,14 @@ impl BatchReadOnlyTransaction {
     /// Execute a partition using a cloned Client for concurrent reads.
     /// Takes `&self` instead of `&mut self`, allowing multiple partitions to be
     /// executed simultaneously. Does not invalidate session on errors.
-    pub async fn execute_concurrent<T: Reader + Sync + Send + 'static>(
-        &self,
+    pub async fn execute_concurrent<'a, T: Reader + Sync + Send + 'static>(
+        &'a self,
         partition: Partition<T>,
         option: Option<CallOptions>,
-    ) -> Result<OwnedRowIterator<T>, Status> {
+    ) -> Result<OwnedRowIterator<'a, T>, Status> {
         let disable_route_to_leader = self.disable_route_to_leader;
         let client = self.as_ref_session().spanner_client.clone();
-        OwnedRowIterator::new(client, partition.reader, option, disable_route_to_leader).await
+        let invalidation_flag = self.invalidation_flag();
+        OwnedRowIterator::new(client, partition.reader, invalidation_flag, option, disable_route_to_leader).await
     }
 }

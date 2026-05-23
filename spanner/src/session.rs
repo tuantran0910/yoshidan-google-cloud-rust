@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::mem;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ const MAX_IN_USE_WINDOW: Duration = Duration::from_secs(600);
 pub struct SessionHandle {
     pub session: Session,
     pub spanner_client: Client,
-    valid: bool,
+    valid: Arc<AtomicBool>,
     deleted: bool,
     last_used_at: Instant,
     last_checked_at: Instant,
@@ -43,7 +44,7 @@ impl SessionHandle {
         SessionHandle {
             session,
             spanner_client,
-            valid: true,
+            valid: Arc::new(AtomicBool::new(true)),
             deleted: false,
             last_used_at: now,
             last_checked_at: now,
@@ -66,7 +67,7 @@ impl SessionHandle {
     }
 
     async fn delete(&mut self) {
-        self.valid = false;
+        self.valid.store(false, Ordering::SeqCst);
         let session_name = &self.session.name;
         let request = DeleteSessionRequest {
             name: session_name.to_string(),
@@ -75,6 +76,10 @@ impl SessionHandle {
             Ok(_) => self.deleted = true,
             Err(e) => tracing::warn!("failed to delete session {}, {:?}", session_name, e),
         };
+    }
+
+    pub(crate) fn invalidation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.valid)
     }
 }
 
@@ -166,7 +171,7 @@ impl Sessions {
         if self.num_inuse > 0 {
             self.num_inuse -= 1;
         }
-        if session.valid {
+        if session.valid.load(Ordering::SeqCst) {
             self.available_sessions.push_back(session);
         } else if !session.deleted {
             tracing::trace!("save as orphan name={}", session.session.name);
@@ -372,9 +377,9 @@ impl SessionPool {
     ///  - If there is no waiting list, the session is returned to the list of available sessions.
     ///    If the session is invalid
     ///  - Discard the session. If the number of sessions falls below the threshold as a result of discarding, the session replenishment process is called.
-    fn recycle(&self, mut session: SessionHandle) {
+    fn recycle(&self, session: SessionHandle) {
         self.metrics.record_session_released();
-        if session.valid {
+        if session.valid.load(Ordering::SeqCst) {
             let mut sessions = self.inner.write();
             let waiter = sessions.take_waiter();
             if sessions.num_opened() > self.config.max_idle
@@ -382,7 +387,7 @@ impl SessionPool {
                 && waiter.is_none()
             {
                 // Not reuse expired idle session
-                session.valid = false
+                session.valid.store(false, Ordering::SeqCst);
             }
             sessions.release(session);
             if let Some(waiter) = waiter {
