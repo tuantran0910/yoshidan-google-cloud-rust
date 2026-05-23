@@ -313,7 +313,9 @@ impl BatchReadOnlyTransaction {
 
     /// Execute a partition using a cloned Client for concurrent reads.
     /// Takes `&self` instead of `&mut self`, allowing multiple partitions to be
-    /// executed simultaneously. Does not invalidate session on errors.
+    /// executed simultaneously. Shares an invalidation flag with the session's
+    /// recycle/release logic so server-side "Session not found" errors mark the
+    /// session invalid for other future callers.
     pub async fn execute_concurrent<'a, T: Reader + Sync + Send + 'static>(
         &'a self,
         partition: Partition<T>,

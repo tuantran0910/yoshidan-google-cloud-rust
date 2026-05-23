@@ -486,6 +486,21 @@ where
     }
 }
 
+/// Marks the shared invalidation flag if the error indicates the session was
+/// deleted on the server. Returns the original result for method chaining.
+#[inline]
+fn check_session_health<T>(
+    flag: &AtomicBool,
+    result: Result<T, Status>,
+) -> Result<T, Status> {
+    if let Err(ref e) = result {
+        if e.code() == Code::NotFound && e.message().contains("Session not found:") {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+    result
+}
+
 pub struct OwnedRowIterator<'a, T: Reader> {
     streaming: Streaming<PartialResultSet>,
     client: Client,
@@ -510,10 +525,10 @@ impl<'a, T: Reader> OwnedRowIterator<'a, T> {
         option: Option<CallOptions>,
         disable_route_to_leader: bool,
     ) -> Result<Self, Status> {
-        let streaming = reader
+        let read_result = reader
             .read_with_client(&mut client, option.clone(), disable_route_to_leader)
-            .await?
-            .into_inner();
+            .await;
+        let streaming = check_session_health(&invalidation_flag, read_result)?.into_inner();
         let rs = ResultSet {
             fields: Arc::new(vec![]),
             index: Arc::new(HashMap::new()),
@@ -575,20 +590,21 @@ impl<'a, T: Reader> OwnedRowIterator<'a, T> {
             let received = match self.streaming.message().await {
                 Ok(s) => s,
                 Err(e) => {
-                    // Set invalidation flag if session was deleted on server
-                    if e.code() == Code::NotFound && e.message().contains("Session not found:") {
-                        self.invalidation_flag.store(false, Ordering::SeqCst);
-                    }
+                    let e = match check_session_health(&self.invalidation_flag, Err::<(), Status>(e)) {
+                        Err(e) => e,
+                        Ok(_) => unreachable!(),
+                    };
                     if !self.reader.can_resume() || !self.resumable {
                         return Err(e);
                     }
                     tracing::debug!("streaming error: {}. resume reading by resume_token", e);
                     self.stream_retry.next(e).await?;
                     let call_option = option.clone();
-                    let result = self
+                    let resume_result = self
                         .reader
                         .read_with_client(&mut self.client, call_option, self.disable_route_to_leader)
-                        .await?;
+                        .await;
+                    let result = check_session_health(&self.invalidation_flag, resume_result)?;
                     self.streaming = result.into_inner();
                     self.prs_buffer.on_resumption();
                     continue;
