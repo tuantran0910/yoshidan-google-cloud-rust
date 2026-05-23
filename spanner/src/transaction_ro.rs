@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use time::OffsetDateTime;
 
 use crate::key::KeySet;
-use crate::reader::{Reader, RowIterator, StatementReader, TableReader};
+use crate::reader::{OwnedRowIterator, Reader, RowIterator, StatementReader, TableReader};
 use crate::session::ManagedSession;
 use crate::statement::Statement;
 use crate::transaction::{CallOptions, QueryOptions, ReadOptions, Transaction};
@@ -309,5 +309,21 @@ impl BatchReadOnlyTransaction {
         let disable_route_to_leader = self.disable_route_to_leader;
         let session = self.as_mut_session();
         RowIterator::new(session, partition.reader, option, disable_route_to_leader).await
+    }
+
+    /// Execute a partition using a cloned Client for concurrent reads.
+    /// Takes `&self` instead of `&mut self`, allowing multiple partitions to be
+    /// executed simultaneously. Shares an invalidation flag with the session's
+    /// recycle/release logic so server-side "Session not found" errors mark the
+    /// session invalid for other future callers.
+    pub async fn execute_concurrent<'a, T: Reader + Sync + Send + 'static>(
+        &'a self,
+        partition: Partition<T>,
+        option: Option<CallOptions>,
+    ) -> Result<OwnedRowIterator<'a, T>, Status> {
+        let disable_route_to_leader = self.disable_route_to_leader;
+        let client = self.as_ref_session().spanner_client.clone();
+        let invalidation_flag = self.invalidation_flag();
+        OwnedRowIterator::new(client, partition.reader, invalidation_flag, option, disable_route_to_leader).await
     }
 }

@@ -1,5 +1,6 @@
-use std::ops::DerefMut;
-use std::sync::atomic::AtomicI64;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicI64};
+use std::sync::Arc;
 
 use prost_types::Struct;
 
@@ -14,7 +15,7 @@ use google_cloud_googleapis::spanner::v1::{
 use crate::key::{Key, KeySet};
 use crate::reader::{Reader, RowIterator, StatementReader, TableReader};
 use crate::row::Row;
-use crate::session::ManagedSession;
+use crate::session::{ManagedSession, SessionHandle};
 use crate::statement::Statement;
 
 #[derive(Clone, Default)]
@@ -272,6 +273,18 @@ impl Transaction {
 
     pub(crate) fn as_mut_session(&mut self) -> &mut ManagedSession {
         self.session.as_mut().unwrap()
+    }
+
+    /// Returns an immutable reference to the underlying session handle.
+    /// Used by `execute_concurrent` to clone the spanner client without mutably borrowing the transaction.
+    pub(crate) fn as_ref_session(&self) -> &SessionHandle {
+        self.session.as_ref().unwrap().deref()
+    }
+
+    /// Returns a shared invalidation flag for concurrent reads to signal
+    /// that the underlying session has been deleted on the server.
+    pub(crate) fn invalidation_flag(&self) -> Arc<AtomicBool> {
+        self.as_ref_session().invalidation_flag()
     }
 
     /// returns the owner ship of session.
