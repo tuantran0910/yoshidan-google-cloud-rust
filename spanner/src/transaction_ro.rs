@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use time::OffsetDateTime;
 
 use crate::key::KeySet;
-use crate::reader::{Reader, RowIterator, StatementReader, TableReader};
+use crate::reader::{ConcurrentRowIterator, Reader, RowIterator, StatementReader, TableReader};
 use crate::session::ManagedSession;
 use crate::statement::Statement;
 use crate::transaction::{CallOptions, QueryOptions, ReadOptions, Transaction};
@@ -115,6 +115,13 @@ impl ReadOnlyTransaction {
     }
 }
 
+/// A partitioned read/query request that can be executed independently.
+///
+/// A single partition obtained from `partition_query` or `partition_read`.
+///
+/// The partition token and all per-partition request fields (session name,
+/// transaction selector, request options, data boost flag, directed read
+/// options) live inside `reader.request`.
 pub struct Partition<T: Reader> {
     pub reader: T,
 }
@@ -309,5 +316,53 @@ impl BatchReadOnlyTransaction {
         let disable_route_to_leader = self.disable_route_to_leader;
         let session = self.as_mut_session();
         RowIterator::new(session, partition.reader, option, disable_route_to_leader).await
+    }
+
+    /// Execute a single partition for concurrent processing.
+    ///
+    /// Unlike `execute(&mut self, ...)`, this method takes `&self` and returns a
+    /// `ConcurrentRowIterator` that owns its gRPC client and a `SessionLease`
+    /// (reference-counted handle into the batch transaction's session). This
+    /// enables multiple partitions to be processed in parallel across spawned
+    /// tasks, and the transaction may be dropped before iteration begins.
+    ///
+    /// All partitions remain tied to the batch transaction's original Spanner
+    /// session and read-only transaction, as required by Spanner for partition
+    /// token execution.
+    ///
+    /// The underlying session is returned to the pool exactly once, either when
+    /// the batch transaction is dropped with no active concurrent iterators, or
+    /// when the last iterator's `SessionLease` is dropped after the transaction.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let tx = client.batch_read_only_transaction().await?;
+    /// let partitions = tx.partition_query(stmt).await?;
+    ///
+    /// let mut iterators = Vec::new();
+    /// for partition in partitions {
+    ///     iterators.push(tx.execute_concurrent(partition, None).await?);
+    /// }
+    /// drop(tx); // safe: iterators own their session leases
+    ///
+    /// let mut tasks = JoinSet::new();
+    /// for iter in iterators {
+    ///     tasks.spawn(async move {
+    ///         let mut iter = iter;
+    ///         while let Some(row) = iter.next().await? {
+    ///             // consume row
+    ///         }
+    ///         Ok::<_, Status>(())
+    ///     });
+    /// }
+    /// ```
+    pub async fn execute_concurrent<T: Reader + Sync + Send + 'static>(
+        &self,
+        partition: Partition<T>,
+        option: Option<CallOptions>,
+    ) -> Result<ConcurrentRowIterator<T>, Status> {
+        let session = self.base_tx.session.as_ref().unwrap();
+        ConcurrentRowIterator::new(session.lease(), partition.reader, option, self.disable_route_to_leader).await
     }
 }

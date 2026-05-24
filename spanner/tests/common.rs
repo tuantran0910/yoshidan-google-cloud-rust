@@ -7,7 +7,7 @@ use google_cloud_googleapis::spanner::v1::Mutation;
 use google_cloud_spanner::client::{ChannelConfig, Client, ClientConfig};
 use google_cloud_spanner::key::Key;
 use google_cloud_spanner::mutation::insert_or_update;
-use google_cloud_spanner::reader::{Reader, RowIterator};
+use google_cloud_spanner::reader::{ConcurrentRowIterator, Reader, RowIterator};
 use google_cloud_spanner::row::{Error as RowError, Row, Struct, TryFromStruct};
 use google_cloud_spanner::session::SessionConfig;
 use google_cloud_spanner::statement::Statement;
@@ -250,6 +250,24 @@ pub fn assert_user_row(row: &Row, source_user_id: &str, now: &OffsetDateTime, co
 
 #[allow(dead_code)]
 pub async fn all_rows(mut itr: RowIterator<'_, impl Reader>) -> Result<Vec<Row>, Status> {
+    let mut rows = vec![];
+    loop {
+        match itr.next().await {
+            Ok(row) => {
+                if let Some(row) = row {
+                    rows.push(row);
+                } else {
+                    break;
+                }
+            }
+            Err(status) => return Err(status),
+        };
+    }
+    Ok(rows)
+}
+
+#[allow(dead_code)]
+pub async fn all_rows_concurrent(mut itr: ConcurrentRowIterator<impl Reader>) -> Result<Vec<Row>, Status> {
     let mut rows = vec![];
     loop {
         match itr.next().await {
