@@ -12,6 +12,7 @@ use google_cloud_spanner::row::Row;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::transaction::QueryOptions;
 use google_cloud_spanner::transaction_ro::ReadOnlyTransaction;
+use tokio::task::JoinSet;
 
 mod common;
 
@@ -227,6 +228,76 @@ async fn test_batch_partition_query_and_read() {
         let user_id = format!("user_partitionx_{x}");
         assert_user_row(map.get(&user_id).unwrap(), &user_id, &now, &ts)
     });
+}
+
+#[tokio::test]
+#[serial]
+async fn test_batch_partition_query_execute_concurrent() {
+    let now = OffsetDateTime::now_utc();
+    let data_client = create_data_client().await;
+    let prefix = format!("user_partition_concurrent_{}", now.unix_timestamp_nanos());
+    let count = 20000;
+    let mutations = (0..count)
+        .map(|x| create_user_mutation(&format!("{prefix}_{x}"), &now))
+        .collect();
+    let _ = data_client.apply(mutations).await.unwrap();
+
+    let mut tx = data_client.batch_read_only_transaction().await.unwrap();
+    let stmt = Statement::new(format!("SELECT * FROM User p WHERE p.UserId LIKE '{prefix}_%'"));
+    let partitions = tx.partition_query(stmt).await.unwrap();
+
+    let mut iters = Vec::with_capacity(partitions.len());
+    for partition in partitions {
+        iters.push(tx.execute_concurrent(partition, None).await.unwrap());
+    }
+    drop(tx);
+
+    let mut tasks = JoinSet::new();
+    for iter in iters {
+        tasks.spawn(async move { all_rows_concurrent(iter).await.map(|rows| rows.len()) });
+    }
+
+    let mut total = 0;
+    while let Some(result) = tasks.join_next().await {
+        total += result.unwrap().unwrap();
+    }
+    assert_eq!(count, total);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_batch_partition_read_execute_concurrent_after_tx_drop() {
+    let now = OffsetDateTime::now_utc();
+    let data_client = create_data_client().await;
+    let prefix = format!("user_partition_read_concurrent_{}", now.unix_timestamp_nanos());
+    let count = 20000;
+    let user_ids = (0..count).map(|x| format!("{prefix}_{x}")).collect::<Vec<_>>();
+    let mutations = user_ids
+        .iter()
+        .map(|user_id| create_user_mutation(user_id, &now))
+        .collect();
+    let _ = data_client.apply(mutations).await.unwrap();
+
+    let mut tx = data_client.batch_read_only_transaction().await.unwrap();
+    let keys = user_ids.iter().map(|user_id| Key::new(user_id)).collect::<Vec<_>>();
+    let partitions = tx.partition_read("User", &user_columns(), keys).await.unwrap();
+
+    let mut iters = Vec::with_capacity(partitions.len());
+    for partition in partitions {
+        iters.push(tx.execute_concurrent(partition, None).await.unwrap());
+    }
+    drop(tx);
+
+    let mut tasks = JoinSet::new();
+    for iter in iters {
+        tasks.spawn(async move { all_rows_concurrent(iter).await.map(|rows| rows.len()) });
+    }
+
+    let mut total = 0;
+    while let Some(result) = tasks.join_next().await {
+        total += result.unwrap().unwrap();
+    }
+    assert_eq!(count, total);
 }
 
 async fn test_query(count: usize, prefix: &str) {

@@ -10,9 +10,10 @@ use google_cloud_googleapis::spanner::v1::{
     ExecuteSqlRequest, PartialResultSet, ReadRequest, ResultSetMetadata, ResultSetStats,
 };
 
+use crate::apiv1::spanner_client::Client;
 use crate::retry::StreamingRetry;
 use crate::row::Row;
-use crate::session::SessionHandle;
+use crate::session::{SessionHandle, SessionLease};
 use crate::transaction::CallOptions;
 
 pub trait Reader: Send + Sync {
@@ -22,6 +23,28 @@ pub trait Reader: Send + Sync {
         option: Option<CallOptions>,
         disable_route_to_leader: bool,
     ) -> impl std::future::Future<Output = Result<Response<Streaming<PartialResultSet>>, Status>> + Send;
+
+    /// Reads using a standalone Spanner client instead of a borrowed session handle.
+    ///
+    /// Custom `Reader` implementations only need to override this method to opt into
+    /// [`BatchReadOnlyTransaction::execute_concurrent`](crate::transaction_ro::BatchReadOnlyTransaction::execute_concurrent).
+    /// The default returns `Unimplemented`, keeping existing `Reader` implementations
+    /// source-compatible while making unsupported concurrent execution fail
+    /// explicitly. Readers that never need concurrent execution may leave this
+    /// method unimplemented.
+    fn read_with_client(
+        &self,
+        _client: &mut Client,
+        _option: Option<CallOptions>,
+        _disable_route_to_leader: bool,
+    ) -> impl std::future::Future<Output = Result<Response<Streaming<PartialResultSet>>, Status>> + Send {
+        async {
+            Err(Status::new(
+                Code::Unimplemented,
+                "concurrent execution is not implemented for this reader",
+            ))
+        }
+    }
 
     fn update_token(&mut self, resume_token: Vec<u8>);
 
@@ -40,12 +63,22 @@ impl Reader for StatementReader {
         option: Option<CallOptions>,
         disable_route_to_leader: bool,
     ) -> Result<Response<Streaming<PartialResultSet>>, Status> {
-        let option = option.unwrap_or_default();
-        let client = &mut session.spanner_client;
-        let result = client
-            .execute_streaming_sql(self.request.clone(), disable_route_to_leader, option.retry)
+        let result = self
+            .read_with_client(&mut session.spanner_client, option, disable_route_to_leader)
             .await;
         session.invalidate_if_needed(result).await
+    }
+
+    async fn read_with_client(
+        &self,
+        client: &mut Client,
+        option: Option<CallOptions>,
+        disable_route_to_leader: bool,
+    ) -> Result<Response<Streaming<PartialResultSet>>, Status> {
+        let option = option.unwrap_or_default();
+        client
+            .execute_streaming_sql(self.request.clone(), disable_route_to_leader, option.retry)
+            .await
     }
 
     fn update_token(&mut self, resume_token: Vec<u8>) {
@@ -68,12 +101,22 @@ impl Reader for TableReader {
         option: Option<CallOptions>,
         disable_route_to_leader: bool,
     ) -> Result<Response<Streaming<PartialResultSet>>, Status> {
-        let option = option.unwrap_or_default();
-        let client = &mut session.spanner_client;
-        let result = client
-            .streaming_read(self.request.clone(), disable_route_to_leader, option.retry)
+        let result = self
+            .read_with_client(&mut session.spanner_client, option, disable_route_to_leader)
             .await;
         session.invalidate_if_needed(result).await
+    }
+
+    async fn read_with_client(
+        &self,
+        client: &mut Client,
+        option: Option<CallOptions>,
+        disable_route_to_leader: bool,
+    ) -> Result<Response<Streaming<PartialResultSet>>, Status> {
+        let option = option.unwrap_or_default();
+        client
+            .streaming_read(self.request.clone(), disable_route_to_leader, option.retry)
+            .await
     }
 
     fn update_token(&mut self, resume_token: Vec<u8>) {
@@ -310,6 +353,37 @@ where
     stream_retry: StreamingRetry,
 }
 
+/// Iterator over rows returned by a single partition executed through
+/// `BatchReadOnlyTransaction::execute_concurrent`.
+///
+/// Unlike `RowIterator`, this iterator owns its gRPC `Client` and a
+/// `SessionLease` (an `Arc`-based reference-counted handle into the same
+/// underlying session), so it carries no borrow on the originating
+/// `BatchReadOnlyTransaction`. Multiple `ConcurrentRowIterator`s can therefore
+/// run in parallel across spawned tasks, and callers may drop the transaction
+/// before processing begins.
+///
+/// The underlying `ManagedSession` is returned to the pool exactly once, either
+/// when the batch transaction is dropped with no active concurrent iterators, or
+/// when the last iterator's `SessionLease` is dropped after the transaction.
+pub struct ConcurrentRowIterator<T>
+where
+    T: Reader,
+{
+    streaming: Streaming<PartialResultSet>,
+    client: Client,
+    session_lease: SessionLease,
+    reader: T,
+    rs: ResultSet,
+    reader_option: Option<CallOptions>,
+    disable_route_to_leader: bool,
+    stats: Option<ResultSetStats>,
+    prs_buffer: ResumablePartialResultSetBuffer,
+    resumable: bool,
+    end_of_stream: bool,
+    stream_retry: StreamingRetry,
+}
+
 impl<'a, T> RowIterator<'a, T>
 where
     T: Reader,
@@ -446,6 +520,160 @@ where
                 return Ok(row);
             }
             // no data found or record chunked.
+            if !self.try_recv(self.reader_option.clone()).await? {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+impl<T> ConcurrentRowIterator<T>
+where
+    T: Reader,
+{
+    pub(crate) async fn new(
+        session_lease: SessionLease,
+        reader: T,
+        option: Option<CallOptions>,
+        disable_route_to_leader: bool,
+    ) -> Result<ConcurrentRowIterator<T>, Status> {
+        // Clone a Client from the lease: we must pass `&mut Client` to
+        // `read_with_client`, and we retain the same client for all subsequent
+        // retries in `try_recv`. The clone is cheap (`Arc<Channel>`).
+        let mut client = session_lease.spanner_client();
+        let streaming = session_lease
+            .invalidate_if_needed(
+                reader
+                    .read_with_client(&mut client, option, disable_route_to_leader)
+                    .await,
+            )
+            .await?
+            .into_inner();
+        let rs = ResultSet {
+            fields: Arc::new(vec![]),
+            index: Arc::new(HashMap::new()),
+            rows: VecDeque::new(),
+            chunked_value: false,
+        };
+        Ok(Self {
+            streaming,
+            client,
+            session_lease,
+            reader,
+            rs,
+            reader_option: None,
+            disable_route_to_leader,
+            stats: None,
+            prs_buffer: ResumablePartialResultSetBuffer::new(DEFAULT_MAX_BYTES_BETWEEN_RESUME_TOKENS),
+            resumable: true,
+            end_of_stream: false,
+            stream_retry: StreamingRetry::new(),
+        })
+    }
+
+    pub fn set_call_options(&mut self, option: CallOptions) {
+        self.reader_option = Some(option);
+    }
+
+    async fn try_recv(&mut self, option: Option<CallOptions>) -> Result<bool, Status> {
+        loop {
+            if let Some(result_set) = self.prs_buffer.pop_ready(self.end_of_stream) {
+                let resume_token_present = !result_set.resume_token.is_empty();
+                if resume_token_present {
+                    self.reader.update_token(result_set.resume_token.clone());
+                }
+                if result_set.stats.is_some() {
+                    self.stats = result_set.stats;
+                }
+                if result_set.values.is_empty() {
+                    self.rs
+                        .add(result_set.metadata, result_set.values, result_set.chunked_value)?;
+                    return Ok(false);
+                }
+                let added = self
+                    .rs
+                    .add(result_set.metadata, result_set.values, result_set.chunked_value)?;
+                if resume_token_present && !self.rs.is_row_boundary() {
+                    return Err(Status::new(Code::FailedPrecondition, "resume token is not on a row boundary"));
+                }
+                return Ok(added);
+            }
+
+            if self.end_of_stream {
+                return Ok(false);
+            }
+
+            let received = match self.streaming.message().await {
+                Ok(s) => s,
+                Err(e) => {
+                    let e = match self.session_lease.invalidate_if_needed::<()>(Err(e)).await {
+                        Err(e) => e,
+                        Ok(_) => unreachable!(),
+                    };
+                    if !self.reader.can_resume() || !self.resumable {
+                        return Err(e);
+                    }
+                    tracing::debug!("streaming error: {}. resume reading by resume_token", e);
+                    self.stream_retry.next(e).await?;
+                    let call_option = option.clone();
+                    let result = self
+                        .session_lease
+                        .invalidate_if_needed(
+                            self.reader
+                                .read_with_client(&mut self.client, call_option, self.disable_route_to_leader)
+                                .await,
+                        )
+                        .await?;
+                    self.streaming = result.into_inner();
+                    self.prs_buffer.on_resumption();
+                    continue;
+                }
+            };
+
+            match received {
+                Some(result_set) => {
+                    if result_set.last {
+                        self.end_of_stream = true;
+                    }
+                    self.prs_buffer.push(result_set);
+                    if self.prs_buffer.unretryable {
+                        self.resumable = false;
+                    }
+                }
+                None => {
+                    self.end_of_stream = true;
+                }
+            }
+        }
+    }
+
+    /// Return metadata for all columns
+    pub fn columns_metadata(&self) -> &Arc<Vec<Field>> {
+        &self.rs.fields
+    }
+
+    pub fn column_metadata(&self, column_name: &str) -> Option<(usize, Field)> {
+        for (i, val) in self.rs.fields.iter().enumerate() {
+            if val.name == column_name {
+                return Some((i, val.clone()));
+            }
+        }
+        None
+    }
+
+    /// Returns query execution statistics if available.
+    pub fn stats(&self) -> Option<&ResultSetStats> {
+        self.stats.as_ref()
+    }
+
+    /// next returns the next result.
+    /// Its second return value is None if there are no more results.
+    pub async fn next(&mut self) -> Result<Option<Row>, Status> {
+        loop {
+            let row = self.rs.next();
+            if row.is_some() {
+                return Ok(row);
+            }
             if !self.try_recv(self.reader_option.clone()).await? {
                 return Ok(None);
             }

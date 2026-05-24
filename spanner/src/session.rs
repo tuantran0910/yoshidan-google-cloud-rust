@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::mem;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,12 +31,40 @@ const MAX_IN_USE_WINDOW: Duration = Duration::from_secs(600);
 pub struct SessionHandle {
     pub session: Session,
     pub spanner_client: Client,
-    valid: bool,
-    deleted: bool,
+    state: Arc<SessionState>,
     last_used_at: Instant,
     last_checked_at: Instant,
     last_pong_at: Instant,
     created_at: Instant,
+}
+
+struct SessionState {
+    valid: AtomicBool,
+    deleted: AtomicBool,
+}
+
+struct DeferredRecycle {
+    active_leases: AtomicUsize,
+    session: Mutex<Option<(SessionPool, SessionHandle)>>,
+}
+
+pub(crate) struct SessionLease {
+    session_name: String,
+    spanner_client: Client,
+    state: Arc<SessionState>,
+    deferred_recycle: Arc<DeferredRecycle>,
+}
+
+impl Clone for SessionLease {
+    fn clone(&self) -> Self {
+        self.deferred_recycle.active_leases.fetch_add(1, Ordering::Relaxed);
+        Self {
+            session_name: self.session_name.clone(),
+            spanner_client: self.spanner_client.clone(),
+            state: self.state.clone(),
+            deferred_recycle: self.deferred_recycle.clone(),
+        }
+    }
 }
 
 impl SessionHandle {
@@ -43,8 +72,10 @@ impl SessionHandle {
         SessionHandle {
             session,
             spanner_client,
-            valid: true,
-            deleted: false,
+            state: Arc::new(SessionState {
+                valid: AtomicBool::new(true),
+                deleted: AtomicBool::new(false),
+            }),
             last_used_at: now,
             last_checked_at: now,
             last_pong_at: now,
@@ -66,13 +97,16 @@ impl SessionHandle {
     }
 
     async fn delete(&mut self) {
-        self.valid = false;
-        let session_name = &self.session.name;
+        self.state.valid.store(false, Ordering::Relaxed);
+        if self.state.deleted.load(Ordering::Relaxed) {
+            return;
+        }
+        let session_name = self.session.name.clone();
         let request = DeleteSessionRequest {
-            name: session_name.to_string(),
+            name: session_name.clone(),
         };
         match self.spanner_client.delete_session(request, true, None).await {
-            Ok(_) => self.deleted = true,
+            Ok(_) => self.state.deleted.store(true, Ordering::Relaxed),
             Err(e) => tracing::warn!("failed to delete session {}, {:?}", session_name, e),
         };
     }
@@ -82,6 +116,7 @@ impl SessionHandle {
 pub struct ManagedSession {
     session_pool: SessionPool,
     session: Option<SessionHandle>,
+    deferred_recycle: Arc<DeferredRecycle>,
 }
 
 impl ManagedSession {
@@ -89,6 +124,21 @@ impl ManagedSession {
         ManagedSession {
             session_pool,
             session: Some(session),
+            deferred_recycle: Arc::new(DeferredRecycle {
+                active_leases: AtomicUsize::new(0),
+                session: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub(crate) fn lease(&self) -> SessionLease {
+        let session = self.session.as_ref().unwrap();
+        self.deferred_recycle.active_leases.fetch_add(1, Ordering::Relaxed);
+        SessionLease {
+            session_name: session.session.name.clone(),
+            spanner_client: session.spanner_client.clone(),
+            state: session.state.clone(),
+            deferred_recycle: self.deferred_recycle.clone(),
         }
     }
 }
@@ -96,7 +146,13 @@ impl ManagedSession {
 impl Drop for ManagedSession {
     fn drop(&mut self) {
         let session = self.session.take().unwrap();
-        self.session_pool.recycle(session);
+        let mut deferred_session = self.deferred_recycle.session.lock();
+        if self.deferred_recycle.active_leases.load(Ordering::Relaxed) > 0 {
+            *deferred_session = Some((self.session_pool.clone(), session));
+        } else {
+            drop(deferred_session);
+            self.session_pool.recycle(session);
+        }
     }
 }
 
@@ -111,6 +167,55 @@ impl Deref for ManagedSession {
 impl DerefMut for ManagedSession {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.session.as_mut().unwrap()
+    }
+}
+
+impl SessionLease {
+    pub(crate) fn spanner_client(&self) -> Client {
+        self.spanner_client.clone()
+    }
+
+    pub(crate) async fn invalidate_if_needed<T>(&self, arg: Result<T, Status>) -> Result<T, Status> {
+        match arg {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                if e.code() == Code::NotFound && e.message().contains("Session not found:") {
+                    tracing::debug!("session invalidate {}", self.session_name);
+                    self.delete().await;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn delete(&self) {
+        self.state.valid.store(false, Ordering::Relaxed);
+        if self.state.deleted.load(Ordering::Relaxed) {
+            return;
+        }
+        let request = DeleteSessionRequest {
+            name: self.session_name.clone(),
+        };
+        let mut client = self.spanner_client.clone();
+        match client.delete_session(request, true, None).await {
+            Ok(_) => self.state.deleted.store(true, Ordering::Relaxed),
+            Err(e) => tracing::warn!("failed to delete session {}, {:?}", self.session_name, e),
+        };
+    }
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let mut deferred_session = self.deferred_recycle.session.lock();
+        // `fetch_sub` returns the value before decrement. If the old value was
+        // not 1, another lease still exists and we must not recycle yet.
+        if self.deferred_recycle.active_leases.fetch_sub(1, Ordering::Relaxed) != 1 {
+            return;
+        }
+        if let Some((session_pool, session)) = deferred_session.take() {
+            drop(deferred_session);
+            session_pool.recycle(session);
+        }
     }
 }
 
@@ -166,9 +271,9 @@ impl Sessions {
         if self.num_inuse > 0 {
             self.num_inuse -= 1;
         }
-        if session.valid {
+        if session.state.valid.load(Ordering::Relaxed) {
             self.available_sessions.push_back(session);
-        } else if !session.deleted {
+        } else if !session.state.deleted.load(Ordering::Relaxed) {
             tracing::trace!("save as orphan name={}", session.session.name);
             self.orphans.push(session);
         }
@@ -372,9 +477,9 @@ impl SessionPool {
     ///  - If there is no waiting list, the session is returned to the list of available sessions.
     ///    If the session is invalid
     ///  - Discard the session. If the number of sessions falls below the threshold as a result of discarding, the session replenishment process is called.
-    fn recycle(&self, mut session: SessionHandle) {
+    fn recycle(&self, session: SessionHandle) {
         self.metrics.record_session_released();
-        if session.valid {
+        if session.state.valid.load(Ordering::Relaxed) {
             let mut sessions = self.inner.write();
             let waiter = sessions.take_waiter();
             if sessions.num_opened() > self.config.max_idle
@@ -382,7 +487,7 @@ impl SessionPool {
                 && waiter.is_none()
             {
                 // Not reuse expired idle session
-                session.valid = false
+                session.state.valid.store(false, Ordering::Relaxed)
             }
             sessions.release(session);
             if let Some(waiter) = waiter {
