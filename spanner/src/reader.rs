@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use prost::Message;
-use prost_types::{value::Kind, Value};
+use prost_types::{value::Kind, Timestamp, Value};
 
 use google_cloud_gax::grpc::{Code, Response, Status, Streaming};
 use google_cloud_googleapis::spanner::v1::struct_type::Field;
@@ -89,6 +89,7 @@ pub struct ResultSet {
     fields: Arc<Vec<Field>>,
     index: Arc<HashMap<String, usize>>,
     rows: VecDeque<Value>,
+    read_timestamp: Option<Timestamp>,
     chunked_value: bool,
 }
 
@@ -251,9 +252,12 @@ impl ResultSet {
         mut values: Vec<Value>,
         chunked_value: bool,
     ) -> Result<bool, Status> {
-        // get metadata only once.
-        if self.fields.is_empty() {
-            if let Some(metadata) = metadata {
+        if let Some(metadata) = metadata {
+            if self.read_timestamp.is_none() {
+                self.read_timestamp = metadata.transaction.and_then(|transaction| transaction.read_timestamp);
+            }
+            // get column metadata only once.
+            if self.fields.is_empty() {
                 self.fields = metadata
                     .row_type
                     .map(|e| Arc::new(e.fields))
@@ -265,6 +269,10 @@ impl ResultSet {
                 }
                 self.index = Arc::new(index);
             }
+        }
+        // Metadata-only responses do not complete a pending chunked value.
+        if values.is_empty() {
+            return Ok(true);
         }
 
         if self.chunked_value {
@@ -328,6 +336,7 @@ where
             fields: Arc::new(vec![]),
             index: Arc::new(HashMap::new()),
             rows: VecDeque::new(),
+            read_timestamp: None,
             chunked_value: false,
         };
         Ok(Self {
@@ -360,12 +369,6 @@ where
                 // Capture stats if present (only sent with the last response)
                 if result_set.stats.is_some() {
                     self.stats = result_set.stats;
-                }
-                if result_set.values.is_empty() {
-                    // Process metadata even when values are empty (e.g., QueryMode::Plan)
-                    self.rs
-                        .add(result_set.metadata, result_set.values, result_set.chunked_value)?;
-                    return Ok(false);
                 }
                 let added = self
                     .rs
@@ -430,6 +433,18 @@ where
         None
     }
 
+    /// Returns the snapshot read timestamp supplied by the server, if available.
+    ///
+    /// The timestamp becomes available as response metadata is consumed by [`Self::next`],
+    /// including when the result contains no rows. For a single-use read-only transaction,
+    /// this allows obtaining the read timestamp without a separate BeginTransaction RPC.
+    /// Returns `None` before metadata is consumed or when the server does not include a
+    /// read timestamp, such as for read-write transactions. For an explicitly begun
+    /// read-only transaction, use [`crate::transaction_ro::ReadOnlyTransaction::rts`].
+    pub fn read_timestamp(&self) -> Option<&Timestamp> {
+        self.rs.read_timestamp.as_ref()
+    }
+
     /// Returns query execution statistics if available.
     /// Stats are only available after all rows have been consumed and only when
     /// the query was executed with a QueryMode that includes stats (Profile, WithStats, or WithPlanAndStats).
@@ -473,6 +488,7 @@ mod tests {
             fields: Arc::new(vec![]),
             index: Arc::new(Default::default()),
             rows: Default::default(),
+            read_timestamp: None,
             chunked_value: false,
         }
     }
@@ -536,11 +552,51 @@ mod tests {
     }
 
     #[test]
+    fn test_rs_read_timestamp_survives_metadata_only_and_resumed_responses() {
+        let timestamp = prost_types::Timestamp {
+            seconds: 123,
+            nanos: 456,
+        };
+        let metadata = ResultSetMetadata {
+            row_type: Some(StructType {
+                fields: vec![field("column1")],
+            }),
+            transaction: Some(google_cloud_googleapis::spanner::v1::Transaction {
+                read_timestamp: Some(timestamp),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut rs = empty_rs();
+        assert!(rs.read_timestamp.is_none());
+        rs.add(Some(metadata.clone()), vec![], false).unwrap();
+        assert_eq!(rs.read_timestamp, Some(timestamp));
+        assert!(rs.next().is_none());
+
+        rs.add(None, vec![value("first")], true).unwrap();
+        rs.add(None, vec![], false).unwrap();
+        assert!(rs.next().is_none());
+        // A resumed response may omit the transaction metadata.
+        rs.add(
+            Some(ResultSetMetadata {
+                transaction: None,
+                ..metadata
+            }),
+            vec![value("last")],
+            false,
+        )
+        .unwrap();
+        assert_some_one_column(rs.next(), "firstlast".to_string());
+        assert_eq!(rs.read_timestamp, Some(timestamp));
+    }
+
+    #[test]
     fn test_rs_next_empty() {
         let mut rs = ResultSet {
             fields: Arc::new(vec![field("column1")]),
             index: Arc::new(Default::default()),
             rows: Default::default(),
+            read_timestamp: None,
             chunked_value: false,
         };
         assert!(rs.next().is_none());
@@ -552,6 +608,7 @@ mod tests {
             fields: Arc::new(vec![field("column1"), field("column2")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(values),
+            read_timestamp: None,
             chunked_value: false,
         };
         let mut rs1 = rs(vec![value("value1")]);
@@ -566,6 +623,7 @@ mod tests {
             fields: Arc::new(vec![field("column1"), field("column2")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(vec![value("value1"), value("value2")]),
+            read_timestamp: None,
             chunked_value,
         };
         assert!(rs(true).next().is_none());
@@ -578,6 +636,7 @@ mod tests {
             fields: Arc::new(vec![field("column1")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(vec![value("value1"), value("value2"), value("value3")]),
+            read_timestamp: None,
             chunked_value,
         };
         let mut incomplete = rs(true);
@@ -597,6 +656,7 @@ mod tests {
             fields: Arc::new(vec![field("column1"), field("column2")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(vec![value("value1"), value("value2"), value("value3")]),
+            read_timestamp: None,
             chunked_value,
         };
         let mut incomplete = rs(true);
@@ -1040,6 +1100,7 @@ mod tests {
             fields: Arc::new(vec![field("column1")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(vec![value("value1")]),
+            read_timestamp: None,
             chunked_value: true,
         };
         assert!(!rs.is_row_boundary());
@@ -1051,6 +1112,7 @@ mod tests {
             fields: Arc::new(vec![field("column1"), field("column2")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(vec![value("value1"), value("value2")]),
+            read_timestamp: None,
             chunked_value: false,
         };
         assert!(rs_complete.is_row_boundary());
@@ -1059,6 +1121,7 @@ mod tests {
             fields: Arc::new(vec![field("column1"), field("column2")]),
             index: Arc::new(Default::default()),
             rows: VecDeque::from(vec![value("value1")]),
+            read_timestamp: None,
             chunked_value: false,
         };
         assert!(!rs_partial.is_row_boundary());

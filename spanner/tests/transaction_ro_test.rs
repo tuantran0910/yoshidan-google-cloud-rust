@@ -86,6 +86,50 @@ async fn test_query_and_read() {
 
 #[tokio::test]
 #[serial]
+async fn test_single_use_read_timestamp() {
+    use google_cloud_spanner::reader::{Reader, RowIterator};
+    use google_cloud_spanner::value::TimestampBound;
+
+    async fn check(mut rows: RowIterator<'_, impl Reader>, timestamp: prost_types::Timestamp, has_row: bool) {
+        assert!(rows.read_timestamp().is_none());
+        assert_eq!(rows.next().await.unwrap().is_some(), has_row);
+        assert!(rows.next().await.unwrap().is_none());
+        assert_eq!(rows.read_timestamp(), Some(&timestamp));
+    }
+
+    let client = create_data_client().await;
+    let user_id = "single_use_read_timestamp";
+    let timestamp = client
+        .apply(vec![create_user_mutation(user_id, &OffsetDateTime::now_utc())])
+        .await
+        .unwrap()
+        .timestamp
+        .unwrap();
+    for (id, has_row) in [(user_id, true), ("missing_read_timestamp_user", false)] {
+        let mut tx = client
+            .single_with_timestamp_bound(TimestampBound::read_timestamp(timestamp.clone()))
+            .await
+            .unwrap();
+        let mut statement = Statement::new("SELECT UserId FROM User WHERE UserId = @id");
+        statement.add_param("id", &id);
+        check(tx.query(statement).await.unwrap(), timestamp.clone().into(), has_row).await;
+        drop(tx);
+
+        let mut tx = client
+            .single_with_timestamp_bound(TimestampBound::read_timestamp(timestamp.clone()))
+            .await
+            .unwrap();
+        check(
+            tx.read("User", &["UserId"], Key::new(&id)).await.unwrap(),
+            timestamp.clone().into(),
+            has_row,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn test_complex_query() {
     let now = OffsetDateTime::now_utc();
     let data_client = create_data_client().await;
