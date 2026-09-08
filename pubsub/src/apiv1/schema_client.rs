@@ -14,11 +14,10 @@ use google_cloud_googleapis::pubsub::v1::{
 use crate::apiv1::conn_pool::ConnectionManager;
 
 #[derive(Clone, Debug)]
-pub(crate) struct SchemaClient {
+pub struct SchemaClient {
     cm: Arc<ConnectionManager>,
 }
 
-#[allow(dead_code)]
 impl SchemaClient {
     /// create new publisher client
     pub fn new(cm: ConnectionManager) -> SchemaClient {

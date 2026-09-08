@@ -4,12 +4,15 @@ use google_cloud_gax::conn::{ConnectionOptions, Environment};
 use google_cloud_gax::grpc::Status;
 use google_cloud_gax::retry::RetrySetting;
 use google_cloud_googleapis::pubsub::v1::{
-    DetachSubscriptionRequest, ListSnapshotsRequest, ListSubscriptionsRequest, ListTopicsRequest, Snapshot,
+    CreateSchemaRequest, DeleteSchemaRequest, DetachSubscriptionRequest, GetSchemaRequest, ListSchemasRequest,
+    ListSnapshotsRequest, ListSubscriptionsRequest, ListTopicsRequest, Schema, SchemaView, Snapshot,
+    ValidateMessageRequest, ValidateMessageResponse, ValidateSchemaRequest, ValidateSchemaResponse,
 };
 use token_source::NoopTokenSourceProvider;
 
 use crate::apiv1::conn_pool::{ConnectionManager, PUBSUB};
 use crate::apiv1::publisher_client::PublisherClient;
+use crate::apiv1::schema_client::SchemaClient;
 use crate::apiv1::subscriber_client::SubscriberClient;
 use crate::subscription::{Subscription, SubscriptionConfig};
 use crate::topic::{Topic, TopicConfig};
@@ -100,6 +103,7 @@ pub struct Client {
     project_id: String,
     pubc: PublisherClient,
     subc: SubscriberClient,
+    schemac: SchemaClient,
 }
 
 impl Client {
@@ -130,10 +134,20 @@ impl Client {
             )
             .await?,
         );
+        let schemac = SchemaClient::new(
+            ConnectionManager::new(
+                config.pool_size,
+                config.endpoint.as_str(),
+                &config.environment,
+                &config.connection_option,
+            )
+            .await?,
+        );
         Ok(Self {
             project_id: config.project_id.ok_or(Error::ProjectIdNotFound)?,
             pubc,
             subc,
+            schemac,
         })
     }
 
@@ -253,6 +267,56 @@ impl Client {
             page_token: "".to_string(),
         };
         self.subc.list_snapshots(req, retry).await
+    }
+
+    /// get_schema gets a schema, e.g. `projects/{project}/schemas/{schema}`. Returns the full
+    /// schema, including its `definition`.
+    pub async fn get_schema(&self, name: &str, retry: Option<RetrySetting>) -> Result<Schema, Status> {
+        let req = GetSchemaRequest {
+            name: name.to_string(),
+            view: SchemaView::Full as i32,
+        };
+        self.schemac.get_schema(req, retry).await.map(|v| v.into_inner())
+    }
+
+    /// create_schema creates a schema.
+    pub async fn create_schema(&self, req: CreateSchemaRequest, retry: Option<RetrySetting>) -> Result<Schema, Status> {
+        self.schemac.create_schema(req, retry).await.map(|v| v.into_inner())
+    }
+
+    /// get_schemas lists the schemas for the client's project.
+    pub async fn get_schemas(&self, retry: Option<RetrySetting>) -> Result<Vec<Schema>, Status> {
+        let req = ListSchemasRequest {
+            parent: self.fully_qualified_project_name(),
+            view: SchemaView::Basic as i32,
+            page_size: 0,
+            page_token: "".to_string(),
+        };
+        self.schemac.list_schemas(req, retry).await
+    }
+
+    /// delete_schema deletes a schema, e.g. `projects/{project}/schemas/{schema}`.
+    pub async fn delete_schema(&self, name: &str, retry: Option<RetrySetting>) -> Result<(), Status> {
+        let req = DeleteSchemaRequest { name: name.to_string() };
+        self.schemac.delete_schema(req, retry).await.map(|_v| ())
+    }
+
+    /// validate_schema validates a schema definition.
+    pub async fn validate_schema(
+        &self,
+        req: ValidateSchemaRequest,
+        retry: Option<RetrySetting>,
+    ) -> Result<ValidateSchemaResponse, Status> {
+        self.schemac.validate_schema(req, retry).await.map(|v| v.into_inner())
+    }
+
+    /// validate_message validates a message against a schema.
+    pub async fn validate_message(
+        &self,
+        req: ValidateMessageRequest,
+        retry: Option<RetrySetting>,
+    ) -> Result<ValidateMessageResponse, Status> {
+        self.schemac.validate_message(req, retry).await.map(|v| v.into_inner())
     }
 
     pub fn fully_qualified_topic_name(&self, id: &str) -> String {
