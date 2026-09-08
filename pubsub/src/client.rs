@@ -388,6 +388,51 @@ mod tests {
         assert_eq!(1, subs_after.len() - subs.len());
         assert_eq!(1, snapshots_after.len() - snapshots.len());
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn test_schema_lifecycle() {
+        use google_cloud_googleapis::pubsub::v1::schema::Type as SchemaType;
+        use google_cloud_googleapis::pubsub::v1::{CreateSchemaRequest, Schema};
+
+        let client = create_client().await;
+
+        let uuid = Uuid::new_v4().hyphenated().to_string();
+        let schema_id = &format!("sch{}", uuid);
+        // The Pub/Sub emulator only supports Avro schema definitions.
+        let definition = r#"{"type":"record","name":"Avro","fields":[{"name":"data","type":"string"}]}"#;
+
+        let schemas = client.get_schemas(None).await.unwrap();
+
+        let created = client
+            .create_schema(
+                CreateSchemaRequest {
+                    parent: "projects/local-project".to_string(),
+                    schema: Some(Schema {
+                        r#type: SchemaType::Avro as i32,
+                        definition: definition.to_string(),
+                        ..Default::default()
+                    }),
+                    schema_id: schema_id.to_string(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(definition, created.definition);
+
+        let fetched = client.get_schema(&created.name, None).await.unwrap();
+        assert_eq!(created.name, fetched.name);
+        assert_eq!(definition, fetched.definition);
+
+        let schemas_after = client.get_schemas(None).await.unwrap();
+        assert_eq!(1, schemas_after.len() - schemas.len());
+
+        client.delete_schema(&created.name, None).await.unwrap();
+
+        let schemas_after_delete = client.get_schemas(None).await.unwrap();
+        assert_eq!(schemas.len(), schemas_after_delete.len());
+    }
 }
 
 #[cfg(test)]
